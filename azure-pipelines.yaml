@@ -1,0 +1,166 @@
+pool:
+  name: Default
+
+jobs:
+- job: Test
+  displayName: Unit Test
+  steps:
+    - task: Maven@4
+      displayName: Unit Test
+      inputs:
+        mavenPomFile: 'webapp/pom.xml'
+        goals: 'clean test'
+        publishJUnitResults: true
+        testResultsFiles: '**/**/surefire-reports/TEST-*.xml'
+        codeCoverageToolOption: 'JaCoCo'
+
+- job: Build
+  displayName: Build
+  dependsOn: Test
+  steps:
+    - task: Maven@4
+      displayName: Build
+      inputs:
+        mavenPomFile: 'webapp/pom.xml'
+        goals: 'clean package'
+    
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/webapp/target/webapp.war'
+        artifact: 'webapp'
+        publishLocation: 'pipeline'
+
+- job: Sonar
+  displayName: Sonar Analysis
+  dependsOn: Build
+  steps:
+    - task: CmdLine@2
+      inputs:
+        script: 'echo Sonar Stage'
+    # - task: SonarQubePrepare@6
+    #   inputs:
+    #     SonarQube: 'sonar-token'
+    #     scannerMode: 'Other'
+    # - task: SonarQubeAnalyze@6
+    #   inputs:
+    #     jdkversion: 'JAVA_HOME_17_X64'
+
+- job: Artifactory
+  displayName: Upload to Artifactory
+  dependsOn: Build
+  steps:
+    - task: CmdLine@2
+      inputs:
+        script: 'echo Artifactory Stage'
+    # - task: DownloadPipelineArtifact@2
+    #   inputs:
+    #     buildType: 'current'
+    #     artifactName: 'webapp'
+    #     targetPath: '$(Build.SourcesDirectory)/'
+    # - task: JFrogGenericArtifacts@1
+    #   inputs:
+    #     command: 'Upload'
+    #     connection: 'artif'
+    #     specSource: 'taskConfiguration'
+    #     fileSpec: |
+    #       {
+        #     "files": [
+        #       {
+        #         "pattern": "**/*.war",
+        #         "target": "example/repo"
+        #       }
+        #     ]
+        #   }
+        # failNoOp: true
+
+- job: DockerBuild
+  displayName: Docker Image Creation
+  dependsOn: Build
+  steps:
+    - checkout: none
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        buildType: 'current'
+        artifactName: 'webapp'
+        targetPath: '$(Build.SourcesDirectory)/'
+    - task: Docker@2
+      displayName: Docker Image Creation
+      inputs:
+        containerRegistry: 'dockerhub'
+        repository: 'iamtitask/web_calc'
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        buildContext: '.'
+
+- job: DockerPush
+  displayName: Docker Push
+  dependsOn: DockerBuild
+  steps:
+    - checkout: none
+    - task: Docker@2
+      inputs:
+        containerRegistry: 'dockerhub'
+        repository: 'iamtitask/web_calc'
+        command: 'push'
+
+- job: DockerRun
+  displayName: Docker Deployment
+  dependsOn: DockerPush
+  steps:
+    - checkout: none
+    - task: CmdLine@2
+      displayName: Docker deployment
+      inputs:
+        script: |
+          docker ps -a -q --filter name=^web_calc$ | xargs docker stop || true
+          docker ps -a -q --filter name=^web_calc$ | xargs docker rm || true
+          docker run -d -p 3060:8080 --name web_calc iamtitask/web_calc:$(Build.BuildId)
+
+- job: SetupMonitoring
+  displayName: Setup Monitoring using DockProm
+  dependsOn: DockerRun
+  steps:
+    - checkout: none
+    - task: CmdLine@2
+      displayName: Dockprom setup
+      inputs:
+        script: |
+          git clone https://github.com/iamtitas/dockprom.git
+          cd dockprom
+          ADMIN_USER='admin' ADMIN_PASSWORD='admin' ADMIN_PASSWORD_HASH='$2a$14$1l.IozJx7xQRVmlkEQ32OeEEfP5mRxTpbDTCTcXRqn19gXD8YK1pO' docker-compose up -d
+
+- job: SeleniumTest
+  displayName: Selenium Functional Testing
+  dependsOn: SetupMonitoring
+  steps:
+    - task: Maven@4
+      displayName: Selenium Funtional Testing
+      inputs:
+        mavenPomFile: 'selenium-test/pom.xml'
+        goals: 'clean test'
+        options: '-Dhostname=192.168.1.19 -Dport=3060 -Dcontext=calculator'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Selenium report
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/selenium-test/target/surefire-reports/emailable-report.html'
+        ArtifactName: 'selenium-reports'
+        publishLocation: 'Container'
+
+- job: JmeterTest
+  displayName: Jmeter Performance Testing
+  dependsOn: SetupMonitoring
+  steps:
+    - task: Maven@4
+      displayName: Jmeter performance testing
+      inputs:
+        mavenPomFile: 'jmeter/pom.xml'
+        goals: 'clean test'
+        options: '-Ddomain=192.168.1.19 -Dport=3060 -Dpath=/calculator'
+    
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Jmeter report
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)/jmeter/target/jmeter/web_calc'
+        ArtifactName: 'jmeter-reports'
+        publishLocation: 'Container'
